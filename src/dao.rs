@@ -20,6 +20,7 @@ struct Reader {
     offset: u64,
 }
 
+#[derive(Debug)]
 struct Record {
     len: usize,
     crc32: u32,
@@ -53,18 +54,21 @@ impl Record {
         vec
     }
 
-    fn decode(p: &[u8], read_position: Option<u64>, file: File) -> anyhow::Result<Self> {
-        let len = usize::from_be_bytes(p[0..7].try_into()?);
-        let crc32 = usize::from_be_bytes(p[8..11].try_into()?);
-        let offset = usize::from_be_bytes(p[12..19].try_into()?);
-        let len: usize = usize::from_be_bytes(p[0..7].try_into()?);
-        Ok(
-			Self { len, crc32, offset: (), payload: () }
-		)
+    fn decode(p: &[u8]) -> anyhow::Result<Self> {
+        let len = usize::from_be_bytes(p[0..8].try_into()?);
+        let crc32: u32 = u32::from_be_bytes(p[8..12].try_into()?);
+        let offset = u64::from_be_bytes(p[12..20].try_into()?);
+        let payload = p[20..20 + len].to_vec();
+        Ok(Self {
+            len,
+            crc32,
+            offset,
+            payload,
+        })
     }
 
-    fn decode_checked(p: &[u8], read_position: Option<u64>, file: File) -> anyhow::Result<Self> {
-        let record = Record::decode(p, read_position, file)?;
+    fn decode_checked(p: &[u8]) -> anyhow::Result<Self> {
+        let record = Record::decode(p)?;
         let mut hasher = Hasher::new();
         hasher.update(&record.offset.to_be_bytes());
         let p = record.payload.clone();
@@ -73,8 +77,6 @@ impl Record {
         ensure!(crc32 == record.crc32, "crc32校验失败，解码失效");
         Ok(record)
     }
-
-
 }
 
 impl Writer {
@@ -121,16 +123,20 @@ mod test {
 
     use anyhow::Ok;
 
-    use crate::dao::Writer;
+    use crate::dao::{Reader, Record, Writer};
 
     #[test]
     fn test_write() -> anyhow::Result<()> {
         let mut w = Writer::new("./local.kr")?;
-        w.write_append("1".to_string())?;
         w.write_append("什么".to_string())?;
-        w.write_append("3".to_string())?;
+        // w.write_append("什么".to_string())?;
+        // w.write_append("3".to_string())?;
         let data: Vec<u8> = fs::read("./local.kr")?;
-        // fs::remove_file("./local.kr");
+        let r = Record::decode(&data)?;
+        println!("写入的一个record为: {:?}", r);
+        println!("解析payload的值为: {:?}", String::from_utf8(r.payload)?);
+        fs::remove_file("./local.kr")?;
+
         Ok(())
     }
 }
