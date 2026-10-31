@@ -1,5 +1,8 @@
 use std::{
-    fs::{File, OpenOptions}, io::{Read, Seek, SeekFrom}, os::unix::fs::FileExt, path::Path,
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
+    os::unix::fs::FileExt,
+    path::Path,
 };
 
 use anyhow::{Context, Ok, bail, ensure};
@@ -15,6 +18,7 @@ struct Reader {
     read_position: u64,
     file: File,
     offset: u64,
+    read_cache: Option<Vec<Record>>,
 }
 
 impl Reader {
@@ -28,18 +32,21 @@ impl Reader {
             read_position: 0,
             file: file.unwrap_or(OpenOptions::new().read(true).open(path)?),
             offset: 0,
+            read_cache: Option::None,
         })
     }
 
     fn from_write(w: &Writer) -> anyhow::Result<Self> {
-        Ok(Reader {
+        Ok(Self {
             read_position: w.write_position,
             file: w.file.try_clone()?,
             offset: w.offset,
+            read_cache: Option::None,
         })
     }
 
-    fn get_list(&mut self,  r: &mut Vec<Record>) -> anyhow::Result<()> {
+    fn get_list(&mut self, r: &mut Vec<Record>) -> anyhow::Result<()> {
+        //读取全部，读取时游标需要放到0位置
         self.file.rewind()?;
 
         let mut vec: Vec<u8> = Vec::new();
@@ -57,14 +64,20 @@ impl Reader {
         Ok(())
     }
 
-    fn find_by_offset(&mut self, offset:u64) -> anyhow::Result<Record> {
+    //走了get_list效率会降低，但是这样实现简单
+    fn find_by_offset(&mut self, offset: u64) -> anyhow::Result<&Record> {
+        if self.read_cache.is_none() {
+            let mut records = Vec::new();
+            self.get_list(&mut records)?;
+            self.read_cache = Some(records);
+        }
 
-        let mut vec = Vec::new();
-        self.get_list(&mut vec)?;
-        vec.into_iter()
+        self.read_cache
+            .as_ref()
+            .unwrap()
+            .iter()
             .find(|r| r.offset == offset)
             .ok_or_else(|| anyhow::anyhow!("Offset {} 不存在", offset))
-
     }
 }
 
@@ -179,7 +192,7 @@ mod test {
         w.write_append("Was ist".to_string())?;
         w.write_append("des Deutschen".to_string())?;
         w.write_append("Vaterland?".to_string())?;
-        let mut rd = Reader::new("./local.kr",None)?;
+        let mut rd = Reader::new("./local.kr", None)?;
         let mut vec = Vec::new();
         rd.get_list(&mut vec)?;
         for m in &vec {
@@ -194,20 +207,22 @@ mod test {
         Ok(())
     }
 
-
-
     #[test]
     fn test_read_exact() -> anyhow::Result<()> {
         let mut w = Writer::new("./local.kr")?;
         w.write_append("Ist's Preußenland?".to_string())?;
         w.write_append("Ist's Schwabenland".to_string())?;
-        let mut rd = Reader::new("./local.kr",None)?;
-        assert_eq!(String::from_utf8(rd.find_by_offset(0)?.payload)?,"Ist's Preußenland?");
-        assert_eq!(String::from_utf8(rd.find_by_offset(1)?.payload)?,"Ist's Schwabenland");
+        let mut rd = Reader::new("./local.kr", None)?;
+        assert_eq!(
+            String::from_utf8(rd.find_by_offset(0)?.payload.clone())?,
+            "Ist's Preußenland?"
+        );
+        assert_eq!(
+            String::from_utf8(rd.find_by_offset(1)?.payload.clone())?,
+            "Ist's Schwabenland"
+        );
         fs::remove_file("./local.kr")?;
 
         Ok(())
     }
-
-
 }
