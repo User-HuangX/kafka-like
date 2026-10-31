@@ -1,9 +1,5 @@
 use std::{
-    fs::{File, OpenOptions},
-    io::Read,
-    os::unix::fs::FileExt,
-    path::Path,
-    sync::BarrierWaitResult,
+    fs::{File, OpenOptions}, io::{Read, Seek, SeekFrom}, os::unix::fs::FileExt, path::Path,
 };
 
 use anyhow::{Context, Ok, bail, ensure};
@@ -20,6 +16,7 @@ struct Reader {
     file: File,
     offset: u64,
 }
+
 impl Reader {
     fn new(path: impl AsRef<Path>, file: Option<File>) -> anyhow::Result<Self> {
         ensure!(
@@ -43,6 +40,8 @@ impl Reader {
     }
 
     fn get_list(&mut self,  r: &mut Vec<Record>) -> anyhow::Result<()> {
+        self.file.rewind()?;
+
         let mut vec: Vec<u8> = Vec::new();
         self.file.read_to_end(&mut vec)?;
         let mut i = 0;
@@ -56,6 +55,16 @@ impl Reader {
             }
         }
         Ok(())
+    }
+
+    fn find_by_offset(&mut self, offset:u64) -> anyhow::Result<Record> {
+
+        let mut vec = Vec::new();
+        self.get_list(&mut vec)?;
+        vec.into_iter()
+            .find(|r| r.offset == offset)
+            .ok_or_else(|| anyhow::anyhow!("Offset {} 不存在", offset))
+
     }
 }
 
@@ -184,4 +193,21 @@ mod test {
 
         Ok(())
     }
+
+
+
+    #[test]
+    fn test_read_exact() -> anyhow::Result<()> {
+        let mut w = Writer::new("./local.kr")?;
+        w.write_append("Ist's Preußenland?".to_string())?;
+        w.write_append("Ist's Schwabenland".to_string())?;
+        let mut rd = Reader::new("./local.kr",None)?;
+        assert_eq!(String::from_utf8(rd.find_by_offset(0)?.payload)?,"Ist's Preußenland?");
+        assert_eq!(String::from_utf8(rd.find_by_offset(1)?.payload)?,"Ist's Schwabenland");
+        fs::remove_file("./local.kr")?;
+
+        Ok(())
+    }
+
+
 }
