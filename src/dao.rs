@@ -3,6 +3,7 @@ use std::{
     io::Read,
     os::unix::fs::FileExt,
     path::Path,
+    sync::BarrierWaitResult,
 };
 
 use anyhow::{Context, Ok, bail, ensure};
@@ -18,6 +19,44 @@ struct Reader {
     read_position: u64,
     file: File,
     offset: u64,
+}
+impl Reader {
+    fn new(path: impl AsRef<Path>, file: Option<File>) -> anyhow::Result<Self> {
+        ensure!(
+            path.as_ref().extension().is_some_and(|ext| ext == "kr"),
+            "日志文件必须使用 .kr 扩展名"
+        );
+
+        Ok(Self {
+            read_position: 0,
+            file: file.unwrap_or(OpenOptions::new().read(true).open(path)?),
+            offset: 0,
+        })
+    }
+
+    fn from_write(w: &Writer) -> anyhow::Result<Self> {
+        Ok(Reader {
+            read_position: w.write_position,
+            file: w.file.try_clone()?,
+            offset: w.offset,
+        })
+    }
+
+    fn get_list(&mut self,  r: &mut Vec<Record>) -> anyhow::Result<()> {
+        let mut vec: Vec<u8> = Vec::new();
+        self.file.read_to_end(&mut vec)?;
+        let mut i = 0;
+        // 这里可以改成异步的
+        loop {
+            let len = usize::from_be_bytes(vec[i..i + 8].try_into()?);
+            r.push(Record::decode_checked(&vec[i..i + 20 + len])?);
+            i = i + 20 + len;
+            if i >= usize::try_from(self.file.metadata()?.len())? {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -103,7 +142,7 @@ impl Writer {
         let len = u64::try_from(input.len())?;
         let next_posotion = self
             .write_position
-            .checked_add(len)
+            .checked_add(len + 20)
             .context("文件偏移量溢出")?;
 
         let record = Record::new(self.offset, input);
@@ -128,13 +167,19 @@ mod test {
     #[test]
     fn test_write() -> anyhow::Result<()> {
         let mut w = Writer::new("./local.kr")?;
-        w.write_append("什么".to_string())?;
-        // w.write_append("什么".to_string())?;
-        // w.write_append("3".to_string())?;
-        let data: Vec<u8> = fs::read("./local.kr")?;
-        let r = Record::decode(&data)?;
-        println!("写入的一个record为: {:?}", r);
-        println!("解析payload的值为: {:?}", String::from_utf8(r.payload)?);
+        w.write_append("Was ist".to_string())?;
+        w.write_append("des Deutschen".to_string())?;
+        w.write_append("Vaterland?".to_string())?;
+        let mut rd = Reader::new("./local.kr",None)?;
+        let mut vec = Vec::new();
+        rd.get_list(&mut vec)?;
+        for m in &vec {
+            println!(
+                "第{}条数据为{}",
+                m.offset,
+                String::from_utf8(m.payload.clone())?
+            );
+        }
         fs::remove_file("./local.kr")?;
 
         Ok(())
