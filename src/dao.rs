@@ -1,11 +1,15 @@
 use std::{
-    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     os::unix::fs::FileExt,
     path::Path,
 };
 
-use anyhow::{Context, Ok, bail, ensure};
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+};
+
+use anyhow::{Context, Ok, ensure};
 use crc32fast::Hasher;
 
 struct Writer {
@@ -22,53 +26,54 @@ struct Reader {
 }
 
 impl Reader {
-    fn new(path: impl AsRef<Path>, file: Option<File>) -> anyhow::Result<Self> {
+    async fn new(path: impl AsRef<Path>, file: Option<File>) -> anyhow::Result<Self> {
         ensure!(
             path.as_ref().extension().is_some_and(|ext| ext == "kr"),
             "日志文件必须使用 .kr 扩展名"
         );
+        let mut new_file = OpenOptions::new().read(true).open(path).await?;
 
         Ok(Self {
             read_position: 0,
-            file: file.unwrap_or(OpenOptions::new().read(true).open(path)?),
+            file: file.unwrap_or(new_file),
             offset: 0,
             read_cache: Option::None,
         })
     }
 
-    fn from_write(w: &Writer) -> anyhow::Result<Self> {
+    async fn from_write(w: &Writer) -> anyhow::Result<Self> {
         Ok(Self {
             read_position: w.write_position,
-            file: w.file.try_clone()?,
+            file: w.file.try_clone().await?,
             offset: w.offset,
             read_cache: Option::None,
         })
     }
 
-    fn get_list(&mut self, r: &mut Vec<Record>) -> anyhow::Result<()> {
+    async fn get_list(&mut self, r: &mut Vec<Record>) -> anyhow::Result<()> {
         //读取全部，读取时游标需要放到0位置
-        self.file.rewind()?;
+        self.file.rewind().await?;
 
         let mut vec: Vec<u8> = Vec::new();
-        self.file.read_to_end(&mut vec)?;
+        self.file.read_to_end(&mut vec).await?;
         let mut i = 0;
         // 这里可以改成异步的
         loop {
             let len = usize::from_be_bytes(vec[i..i + 8].try_into()?);
             r.push(Record::decode_checked(&vec[i..i + 20 + len])?);
             i = i + 20 + len;
-            if i >= usize::try_from(self.file.metadata()?.len())? {
+            if i >= usize::try_from(self.file.metadata().await?.len())? {
                 break;
             }
         }
         Ok(())
     }
 
-    //走了get_list效率会降低，但是这样实现简单
-    fn find_by_offset(&mut self, offset: u64) -> anyhow::Result<&Record> {
+    //先读取稀疏索引，然后再读取
+    async fn find_by_offset(&mut self, offset: u64) -> anyhow::Result<&Record> {
         if self.read_cache.is_none() {
             let mut records = Vec::new();
-            self.get_list(&mut records)?;
+            self.get_list(&mut records).await?;
             self.read_cache = Some(records);
         }
 
@@ -141,22 +146,26 @@ impl Record {
 }
 
 impl Writer {
-    fn new(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    async fn new(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         ensure!(
             path.as_ref().extension().is_some_and(|ext| ext == "kr"),
             "日志文件必须使用 .kr 扩展名"
         );
 
-        let file = OpenOptions::new().create(true).write(true).open(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .await?;
 
         Ok(Writer {
-            write_position: file.metadata()?.len(),
+            write_position: file.metadata().await?.len(),
             file,
             offset: 0,
         })
     }
 
-    pub fn write_append(&mut self, input: String) -> anyhow::Result<()> {
+    pub async fn write_append(&mut self, input: String) -> anyhow::Result<()> {
         if input.is_empty() {
             return Ok(());
         }
@@ -168,33 +177,32 @@ impl Writer {
             .context("文件偏移量溢出")?;
 
         let record = Record::new(self.offset, input);
+        // save the raw record
+        self.file.write_all(&record.encode()).await?;
 
-        self.file
-            .write_all_at(&record.encode(), self.write_position)?;
         self.write_position = next_posotion;
         self.offset += 1;
         Ok(())
     }
 }
 mod test {
-    use std::{
-        fs::{self, File, OpenOptions},
-        io::Read,
-    };
-
     use anyhow::Ok;
+    use std::{fs, io::Read};
+    use tokio::{
+        io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    };
 
     use crate::dao::{Reader, Record, Writer};
 
-    #[test]
-    fn test_write() -> anyhow::Result<()> {
-        let mut w = Writer::new("./local.kr")?;
-        w.write_append("Was ist".to_string())?;
-        w.write_append("des Deutschen".to_string())?;
-        w.write_append("Vaterland?".to_string())?;
-        let mut rd = Reader::new("./local.kr", None)?;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_write() -> anyhow::Result<()> {
+        let mut w = Writer::new("./local.kr").await?;
+        w.write_append("Was ist".to_string()).await?;
+        w.write_append("des Deutschen".to_string()).await?;
+        w.write_append("Vaterland?".to_string()).await?;
+        let mut rd = Reader::new("./local.kr", None).await?;
         let mut vec = Vec::new();
-        rd.get_list(&mut vec)?;
+        rd.get_list(&mut vec).await?;
         for m in &vec {
             println!(
                 "第{}条数据为{}",
@@ -203,22 +211,22 @@ mod test {
             );
         }
         fs::remove_file("./local.kr")?;
-
         Ok(())
     }
 
-    #[test]
-    fn test_read_exact() -> anyhow::Result<()> {
-        let mut w = Writer::new("./local.kr")?;
-        w.write_append("Ist's Preußenland?".to_string())?;
-        w.write_append("Ist's Schwabenland".to_string())?;
-        let mut rd = Reader::new("./local.kr", None)?;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_read_exact() -> anyhow::Result<()> {
+        let mut w = Writer::new("./local.kr").await?;
+        w.write_append("Ist's Preußenland?".to_string()).await?;
+        w.write_append("Ist's Schwabenland".to_string()).await?;
+        let mut rd = Reader::new("./local.kr", None).await?;
         assert_eq!(
-            String::from_utf8(rd.find_by_offset(0)?.payload.clone())?,
+            String::from_utf8(rd.find_by_offset(0).await?.payload.clone())?,
             "Ist's Preußenland?"
         );
         assert_eq!(
-            String::from_utf8(rd.find_by_offset(1)?.payload.clone())?,
+            String::from_utf8(rd.find_by_offset(1).await?.payload.clone())?,
             "Ist's Schwabenland"
         );
         fs::remove_file("./local.kr")?;
