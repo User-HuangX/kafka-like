@@ -1,22 +1,21 @@
 // TODO(第8条): HashMap/Arc/RwLock 未使用；path: String 建议 PathBuf；20 这个头部长度魔数应提成常量
-use std::{collections::HashMap, path::Path, sync::Arc}
-;
+use std::{io::SeekFrom, path::Path};
 
 use tokio::{
-    fs::{File, OpenOptions}, io::AsyncWriteExt, sync::RwLock,
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 
+use crate::dao::data::Record;
 use anyhow::{Context, Ok, ensure};
-use crate::dao::data::{Record};
 
 pub struct Writer {
     write_position: u64,
     file: File,
     index: File,
     path: String,
-    offset: u64
+    offset: u64,
 }
-
 
 impl Writer {
     async fn new(path: &str) -> anyhow::Result<Self> {
@@ -32,20 +31,29 @@ impl Writer {
             .write(true)
             .open(path)
             .await?;
-        let index = OpenOptions::new()
+
+        let mut index = OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open(format!("{path}.index"))
             .await?;
 
+        let max_len = file.metadata().await?.len();
+        let mut offset = 0;
+        if max_len >= 16 {
+            let mut buf = [0u8; 8];
+            index.seek(SeekFrom::End(-16)).await?;
+            index.read_exact(&mut buf).await?;
+            offset = u64::from_be_bytes(buf);
+        }
+        index.flush().await?;
         Ok(Writer {
-            write_position: file.metadata().await?.len(),
+            write_position: max_len,
             file,
             index,
             path: String::from(path),
-            // TODO(第2条): 重启后应从索引末项恢复 offset+1；恒为 0 会与旧记录撞号
-            offset: 0,
+            offset: offset + 1,
         })
     }
 
@@ -61,14 +69,22 @@ impl Writer {
             .context("文件偏移量溢出")?;
 
         let record = Record::new(self.offset, input);
+        self.file.seek(SeekFrom::End(0)).await?;
+        self.index.seek(SeekFrom::End(0)).await?;
         // save the raw record
         self.file.write_all(&record.encode()).await?;
 
         //save the index
-        self.index.write_all(&record.encode_index(self.write_position)).await?;
+        if record.offset > self.index.metadata().await?.len() / 160 {
+            self.index
+                .write_all(&record.encode_index(self.write_position))
+                .await?;
+        }
+
         self.write_position = next_posotion;
         self.offset += 1;
-        // TODO(第6条): 两个文件都没 flush/sync_data，崩溃时索引与数据可能不一致
+        self.index.flush().await?;
+        self.file.flush().await?;
         Ok(())
     }
 }
