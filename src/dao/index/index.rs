@@ -29,25 +29,29 @@ impl IndexWriteHandler {
             seek: 0,
         })
     }
-
-
 }
 
 const DENSITY: u64 = 10;
 
 impl Index {
-    pub async fn sycn_entry(offset: u64, position: u64) -> anyhow::Result<()> {
+    pub async fn sycn_entry(
+        h: &mut IndexWriteHandler,
+        offset: u64,
+        position: u64,
+    ) -> anyhow::Result<()> {
         if offset / DENSITY <= Self::read_last_entry().await?.offset {
             return Ok(());
         }
-
-        file.write_all(&IndexSerializer::encode(offset, position))
+        h.file.seek(SeekFrom::End(0)).await?;
+        h.file
+            .write_all(&IndexSerializer::encode(offset, position))
             .await?;
         Ok(())
     }
 
-    pub async fn read_entry(file: &mut File, index: u64) -> anyhow::Result<Self> {
-        file.seek(SeekFrom::Start(index * 16)).await?;
+    pub async fn read_entry(seek: SeekFrom) -> anyhow::Result<Self> {
+        let mut file = OpenOptions::new().read(true).open("./index.kr").await?;
+        file.seek(seek).await?;
 
         let mut buf = [0u8; 16];
         file.read_exact(&mut buf).await?;
@@ -60,23 +64,17 @@ impl Index {
 
     // read recent entry
     pub async fn read_last_entry() -> anyhow::Result<Self> {
-        let mut file = OpenOptions::new().read(true).open("index.kr").await?;
-        file.seek(SeekFrom::End(-16)).await?;
-        let mut buf = [0u8; 16];
-        file.read_exact(&mut buf).await?;
-        let offset = u64::from_be_bytes(buf[0..8].try_into().unwrap());
-        let position = u64::from_be_bytes(buf[8..16].try_into().unwrap());
-        Ok(Self { offset, position })
+        let seek = SeekFrom::End(16);
+        Ok(Self::read_entry(seek).await?)
     }
 
     pub async fn find_index_range(
         path: &str,
         target: u64,
     ) -> anyhow::Result<(Option<Index>, Option<Index>)> {
-        let mut file = OpenOptions::new().read(true).open(path).await?;
+        let file = OpenOptions::new().read(true).open(path).await?;
         let len = file.metadata().await?.len();
-        // TODO(第7条): 太硬 —— 崩溃留下的半个索引项(8字节)会让整个索引永久报错
-        //              应向下取整到 16 的倍数并容忍尾部残缺
+
         ensure!(len % 16 == 0, "index len invaild");
 
         let mut left = 0;
@@ -88,7 +86,7 @@ impl Index {
             let Index {
                 offset,
                 position: _,
-            } = Index::read_entry(&mut file, mid).await?;
+            } = Index::read_entry(SeekFrom::Start(mid)).await?;
 
             if offset <= target {
                 left = mid + 1;
@@ -100,11 +98,12 @@ impl Index {
         if left == 0 {
             return Ok((None, None));
         }
-        let l = Index::read_entry(&mut file, left - 1).await?;
-        if left == Index::read_last_entry().await?.offset {
-            let r = Index::read_entry(&mut file, left).await?;
+        let l = Index::read_entry(SeekFrom::Start(left - 1)).await?;
+        if left != Index::read_last_entry().await?.offset {
+            let r = Index::read_entry(SeekFrom::Start(left)).await?;
             return Ok((Some(l), Some(r)));
         }
         Ok((Some(l), None))
     }
 }
+

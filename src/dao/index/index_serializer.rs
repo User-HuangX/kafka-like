@@ -20,6 +20,7 @@ impl IndexSerializer {
         if p.len() % 16 != 0 {
             return Err(anyhow!("index len error"));
         }
+        
         let offset = u64::from_be_bytes(p[0..LEN_SIZE].try_into().unwrap());
         let position = u64::from_be_bytes(p[LEN_SIZE..LEN_SIZE + POSITION_LEN].try_into().unwrap());
         Ok(Index { offset, position })
