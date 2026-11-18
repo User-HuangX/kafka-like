@@ -1,2 +1,2 @@
-mod index;
-mod index_serializer;
+pub mod index;
+pub(crate) mod index_serializer;

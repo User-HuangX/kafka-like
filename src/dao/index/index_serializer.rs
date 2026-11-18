@@ -1,5 +1,4 @@
-use anyhow::{Ok, anyhow};
-use std::fs;
+use anyhow::anyhow;
 
 use crate::dao::{data::LEN_SIZE, index::index::Index};
 
@@ -15,7 +14,7 @@ impl IndexSerializer {
     }
 
     fn decode_exact(p: &[u8]) -> anyhow::Result<Index> {
-        if p.len() % 16 != 0 {
+        if p.len() != LEN_SIZE + POSITION_LEN {
             return Err(anyhow!("index len error"));
         }
 
@@ -25,7 +24,7 @@ impl IndexSerializer {
     }
 
     pub fn decode_all(p: &[u8]) -> anyhow::Result<Vec<Index>> {
-        if p.len() % 16 != 0 {
+        if !p.len().is_multiple_of(16) {
             return Err(anyhow!("index len error"));
         }
         let mut i = 0;

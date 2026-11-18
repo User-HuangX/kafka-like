@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 crc32fast = "1.5.3"
+serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"

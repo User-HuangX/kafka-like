@@ -1,25 +1,26 @@
-// TODO(第8条): HashMap/Arc/RwLock 未使用；path: String 建议 PathBuf；20 这个头部长度魔数应提成常量
 use std::{io::SeekFrom, path::Path};
 
+use anyhow::{ensure, Context};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt},
 };
 
-use crate::dao::data::Record;
-use anyhow::{Context, Ok, ensure};
+use crate::config::CONFIG;
+use crate::dao::data::{Record, RecordSerializer};
+use crate::dao::index::index::{Index, IndexWriteHandler};
+use crate::dao::read::Reader;
 
 pub struct Writer {
     write_position: u64,
+    last_offset: u64,
     file: File,
-    index: File,
-    path: String,
-    offset: u64,
+    index: IndexWriteHandler,
 }
 
 impl Writer {
-    async fn new(path: &str) -> anyhow::Result<Self> {
-        let p = Path::new(path);
+    pub async fn new(index: IndexWriteHandler) -> anyhow::Result<Self> {
+        let p = Path::new(&CONFIG.dao.path);
         ensure!(
             p.extension().is_some_and(|ext| ext == "kr"),
             "日志文件必须使用 .kr 扩展名"
@@ -27,64 +28,49 @@ impl Writer {
 
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .read(true)
             .write(true)
-            .open(path)
+            .open(p)
             .await?;
 
-        let mut index = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(format!("{path}.index"))
-            .await?;
+        let write_position = file.metadata().await?.len();
+        // 重启后从日志里恢复最后一条消息的 offset，而不是依赖稀疏索引。
+        let last_offset = if write_position == 0 {
+            0
+        } else {
+            Reader::find_last().await?.offset
+        };
 
-        let max_len = file.metadata().await?.len();
-        let mut offset = 0;
-        if max_len >= 16 {
-            let mut buf = [0u8; 8];
-            index.seek(SeekFrom::End(-16)).await?;
-            index.read_exact(&mut buf).await?;
-            offset = u64::from_be_bytes(buf);
-        }
-        index.flush().await?;
         Ok(Writer {
-            write_position: max_len,
+            write_position,
+            last_offset,
             file,
             index,
-            path: String::from(path),
-            offset: offset + 1,
         })
     }
 
     pub async fn write_append(&mut self, input: String) -> anyhow::Result<()> {
-        if input.is_empty() {
-            return Ok(());
-        }
+        let offset = self.last_offset + 1;
+        let record = Record::new(offset, input);
+        let bytes = RecordSerializer::encode(&record);
 
-        let len = u64::try_from(input.len())?;
-        let next_posotion = self
+        let next_position = self
             .write_position
-            .checked_add(len + 20)
+            .checked_add(u64::try_from(bytes.len())?)
             .context("文件偏移量溢出")?;
 
-        let record = Record::new(self.offset, input);
-        self.file.seek(SeekFrom::End(0)).await?;
-        self.index.seek(SeekFrom::End(0)).await?;
-        // save the raw record
-        self.file.write_all(&record.encode()).await?;
-
-        //save the index
-        if record.offset > self.index.metadata().await?.len() / 160 {
-            self.index
-                .write_all(&record.encode_index(self.write_position))
-                .await?;
-        }
-
-        self.write_position = next_posotion;
-        self.offset += 1;
-        self.index.flush().await?;
+        // 先写日志，再更新稀疏索引；索引里的 position 是这条消息的起始位置。
+        self.file
+            .seek(SeekFrom::Start(self.write_position))
+            .await?;
+        self.file.write_all(&bytes).await?;
         self.file.flush().await?;
+
+        Index::sync_entry(&mut self.index, offset, self.write_position).await?;
+
+        self.write_position = next_position;
+        self.last_offset = offset;
         Ok(())
     }
 }

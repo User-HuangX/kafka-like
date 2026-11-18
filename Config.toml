@@ -1,0 +1,3 @@
+[dao]
+index_path = "./index.kr"
+path = "./msg.kr"

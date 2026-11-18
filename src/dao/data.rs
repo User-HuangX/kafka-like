@@ -32,7 +32,7 @@ impl Record {
         hasher.update(&offset.to_be_bytes());
         let p = payload.into_bytes();
         hasher.update(&p);
-        hasher.update(&p.len().to_be_bytes());
+        hasher.update(&(p.len() as u64).to_be_bytes());
         let crc32 = hasher.finalize();
 
         Self {
@@ -44,19 +44,22 @@ impl Record {
     }
 }
 
-struct RecordSerializer;
+pub struct RecordSerializer;
 impl RecordSerializer {
     pub fn encode(r: &Record) -> Vec<u8> {
         let mut vec = Vec::new();
-        vec.extend(r.len.to_be_bytes());
+        vec.extend((r.len as u64).to_be_bytes());
         vec.extend(r.crc32.to_be_bytes());
         vec.extend(r.offset.to_be_bytes());
-        vec.extend_from_slice(&mut r.payload.to_vec());
+        vec.extend_from_slice(&r.payload);
         vec
     }
 
     fn decode_exact(p: &[u8]) -> anyhow::Result<Record> {
-        let len = usize::from_be_bytes(p[0..LEN_SIZE].try_into()?);
+        if p.len() < META_SIZE {
+            return Err(anyhow!("the size of slice less than meta size {META_SIZE}"));
+        }
+        let len = usize::try_from(u64::from_be_bytes(p[0..LEN_SIZE].try_into()?))?;
         if p.len() != META_SIZE + len {
             return Err(anyhow!("the slice size error"));
         }
@@ -78,27 +81,28 @@ impl RecordSerializer {
         let record = Self::decode_exact(p)?;
         let mut hasher = Hasher::new();
         hasher.update(&record.offset.to_be_bytes());
-        let p = record.payload.clone();
-        hasher.update(&p);
-        hasher.update(&p.len().to_be_bytes());
+        hasher.update(&record.payload);
+        hasher.update(&(record.payload.len() as u64).to_be_bytes());
         let crc32 = hasher.finalize();
         ensure!(crc32 == record.crc32, "crc32 verification failed!");
         Ok(record)
     }
 
     pub fn decode(p: &[u8]) -> anyhow::Result<Vec<Record>> {
-        if p.len() < LEN_SIZE {
-            return Err(anyhow!("payload len err"));
-        }
-        let mut len;
-        let mut i = 0;
+        let mut i = 0usize;
         let mut vec: Vec<Record> = Vec::new();
-        while p.len() > i {
-            len = usize::from_be_bytes(p[i..i + LEN_SIZE].try_into()?);
-            let r = Self::decode_checked(&p[i..i + META_SIZE + len])?;
+        while p.len() - i >= LEN_SIZE {
+            let len = usize::try_from(u64::from_be_bytes(p[i..i + LEN_SIZE].try_into()?))?;
+            let need = META_SIZE
+                .checked_add(len)
+                .ok_or_else(|| anyhow!("record length overflow"))?;
+            // 结尾处允许出现不完整的 record（例如写入途中崩溃）
+            if p.len() - i < need {
+                break;
+            }
+            let r = Self::decode_checked(&p[i..i + need])?;
             vec.push(r);
-
-            i = i + META_SIZE + len;
+            i += need;
         }
         Ok(vec)
     }
